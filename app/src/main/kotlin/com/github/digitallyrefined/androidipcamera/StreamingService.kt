@@ -172,8 +172,10 @@ class StreamingService : LifecycleService() {
 
     private fun restartServer() {
         lifecycleScope.launch(Dispatchers.IO) {
-            streamingServerHelper?.stopServer()
-            kotlinx.coroutines.delay(500)
+            // Wait until accept() has been interrupted and the old server coroutine has fully
+            // unwound before binding a replacement listener. stopServer() cleared the shared
+            // references immediately, which allowed a second listener to race the first one.
+            streamingServerHelper?.stopStreamingServer()
             streamingServerHelper?.startStreamingServer()
         }
     }

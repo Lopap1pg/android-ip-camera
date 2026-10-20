@@ -34,6 +34,7 @@ import java.io.InputStreamReader
 import java.io.OutputStream
 import java.io.PrintWriter
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
@@ -439,8 +440,12 @@ class StreamingServerHelper(
                                       val sslServerSocketFactory = sslContext.serverSocketFactory
                                       for (bindAttempt in 0..SOCKET_BIND_MAX_RETRIES) {
                                           try {
-                                              sslServerSocket = (sslServerSocketFactory.createServerSocket(port, 50, bindAddress) as SSLServerSocket).apply {
+                                              // createServerSocket(port, ...) binds before the apply block runs,
+                                              // which makes reuseAddress too late to help with rapid restarts.
+                                              // Create an unbound socket, set SO_REUSEADDR first, then bind.
+                                              sslServerSocket = (sslServerSocketFactory.createServerSocket() as SSLServerSocket).apply {
                                                   reuseAddress = true
+                                                  bind(InetSocketAddress(bindAddress, port), 50)
                                                   enabledProtocols = arrayOf(tlsVersion)
                                                   // Don't restrict cipher suites - let the system negotiate
                                                   soTimeout = 30000
@@ -479,14 +484,25 @@ class StreamingServerHelper(
                           readyServerSocket
                       } catch (keystoreException: Exception) {
                           Handler(Looper.getMainLooper()).post {
-                              onLog("Certificate loading failed: ${keystoreException.message}")
+                              val message = keystoreException.message ?: "Unknown error"
+                              val isBindError = message.contains("Address already in use") ||
+                                  message.contains("BindException") ||
+                                  message.contains("errno = 48") ||
+                                  message.contains("EADDRINUSE")
+                              if (isBindError) {
+                                  onLog("HTTPS bind failed on port $port: $message")
+                              } else {
+                                  onLog("Certificate loading failed: $message")
+                              }
                               val errorMsg = when {
-                                  keystoreException.message?.contains("password") == true ->
+                                  isBindError ->
+                                      "Failed to start HTTPS server: port $port is already in use"
+                                  message.contains("password") ->
                                       "Certificate password is incorrect, check Settings > Advanced Security"
-                                  keystoreException.message?.contains("keystore") == true ->
+                                  message.contains("keystore") ->
                                       "Certificate file is corrupted or invalid, regenerate with setup.bat"
                                   else ->
-                                      "Certificate error: ${keystoreException.message}"
+                                      "Certificate error: $message"
                               }
                               Toast.makeText(context, errorMsg, Toast.LENGTH_LONG).show()
                           }
@@ -498,8 +514,10 @@ class StreamingServerHelper(
                           var httpSocket: ServerSocket? = null
                           for (bindAttempt in 0..SOCKET_BIND_MAX_RETRIES) {
                               try {
-                                  httpSocket = ServerSocket(port, 50, bindAddress).apply {
+                                  // Configure SO_REUSEADDR before bind for the same reason as TLS above.
+                                  httpSocket = ServerSocket().apply {
                                       reuseAddress = true
+                                      bind(InetSocketAddress(bindAddress, port), 50)
                                       soTimeout = 30000
                                   }
                                   break
