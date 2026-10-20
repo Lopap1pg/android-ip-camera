@@ -32,6 +32,7 @@ import com.github.digitallyrefined.androidipcamera.helpers.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -58,6 +59,9 @@ class StreamingService : LifecycleService() {
 
     private val binder = LocalBinder()
     var streamingServerHelper: StreamingServerHelper? = null
+    private val serverInitLock = Any()
+    @Volatile private var certificateGenerationInProgress = false
+    @Volatile private var serviceShuttingDown = false
 
     // Streaming encoders (initialized when server is created)
     private var h264StreamingEncoder: H264StreamingEncoder? = null
@@ -166,6 +170,10 @@ class StreamingService : LifecycleService() {
     }
 
     private fun handleStopService() {
+        serviceShuttingDown = true
+        // Fully release the listener before the Service is allowed to disappear. The server job
+        // runs on its own IO scope, so relying on lifecycle cancellation can leave :4444 alive.
+        runBlocking(Dispatchers.IO) { streamingServerHelper?.stopStreamingServer() }
         sendBroadcast(Intent("com.github.digitallyrefined.androidipcamera.CLOSE_APP").setPackage(packageName))
         stopForeground(true); stopSelf()
     }
@@ -218,7 +226,11 @@ class StreamingService : LifecycleService() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        serviceShuttingDown = true
+        // StreamingServerHelper owns an independent IO coroutine. Stop and join it synchronously
+        // before super.onDestroy() cancels LifecycleService's scope; otherwise an orphan listener
+        // can survive this Service instance and make the next one fail with EADDRINUSE.
+        runBlocking(Dispatchers.IO) { streamingServerHelper?.stopStreamingServer() }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
             try { unregisterReceiver(notificationChannelReceiver) } catch (_: Exception) {}
         safeStopRecording()
@@ -229,7 +241,7 @@ class StreamingService : LifecycleService() {
         // A setTorchMode torch outlives the process — release it explicitly or the LED burns
         // forever after the service is stopped.
         if (deviceTorchOn) setDeviceTorch(false)
-        lifecycleScope.launch(Dispatchers.IO) { streamingServerHelper?.stopStreamingServer() }
+        super.onDestroy()
     }
 
     private fun startForegroundService() {
@@ -298,6 +310,7 @@ class StreamingService : LifecycleService() {
     // ---------------- server lifecycle (TLS cert + on-demand camera) ----------------
 
     fun startStreamingServer() {
+        if (serviceShuttingDown) return
         try {
             val secureStorage = SecureStorage(this)
             if (CertificateHelper.certificateExists(this)) {
@@ -310,22 +323,33 @@ class StreamingService : LifecycleService() {
     }
 
     private fun generateCertificateAndStart() {
+        synchronized(serverInitLock) {
+            if (serviceShuttingDown || certificateGenerationInProgress) return
+            certificateGenerationInProgress = true
+        }
         val pw = generateRandomPassword()
         lifecycleScope.launch(Dispatchers.IO) {
-            val certFile = CertificateHelper.generateCertificate(this@StreamingService, pw)
-            if (certFile != null) {
-                SecureStorage(this@StreamingService).putSecureString(SecureStorage.KEY_CERT_PASSWORD, pw)
-                PreferenceManager.getDefaultSharedPreferences(this@StreamingService).edit().remove("certificate_path").apply()
-                kotlinx.coroutines.delay(100)
-                initServer()
-            } else launch(Dispatchers.Main) {
-                Toast.makeText(this@StreamingService, "Failed to generate certificate", Toast.LENGTH_LONG).show()
+            try {
+                val certFile = CertificateHelper.generateCertificate(this@StreamingService, pw)
+                if (certFile != null && !serviceShuttingDown) {
+                    SecureStorage(this@StreamingService).putSecureString(SecureStorage.KEY_CERT_PASSWORD, pw)
+                    PreferenceManager.getDefaultSharedPreferences(this@StreamingService).edit().remove("certificate_path").apply()
+                    kotlinx.coroutines.delay(100)
+                    if (!serviceShuttingDown) initServer()
+                } else if (certFile == null) launch(Dispatchers.Main) {
+                    Toast.makeText(this@StreamingService, "Failed to generate certificate", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                synchronized(serverInitLock) { certificateGenerationInProgress = false }
             }
         }
     }
 
     private fun initServer() {
-        if (streamingServerHelper == null) {
+        if (serviceShuttingDown) return
+        synchronized(serverInitLock) {
+            if (serviceShuttingDown) return
+            if (streamingServerHelper == null) {
             streamingServerHelper = StreamingServerHelper(
                 this,
                 onLog = { Log.i(TAG, "Server: $it"); onLog?.invoke(it) },
@@ -382,8 +406,9 @@ class StreamingService : LifecycleService() {
             // Initialize encoders with the streaming server helper
             h264StreamingEncoder = H264StreamingEncoder(this, streamingServerHelper!!) { Log.i(TAG, "H264: $it"); onLog?.invoke(it) }
             mjpegStreamingEncoder = MjpegStreamingEncoder(this, streamingServerHelper!!) { Log.i(TAG, "MJPEG: $it"); onLog?.invoke(it) }
+            }
+            streamingServerHelper?.startStreamingServer()
         }
-        streamingServerHelper?.startStreamingServer()
     }
 
     private fun launchMain(block: suspend () -> Unit) { lifecycleScope.launch(Dispatchers.Main) { block() } }
